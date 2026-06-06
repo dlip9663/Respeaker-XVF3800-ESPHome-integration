@@ -35,6 +35,9 @@ void RespeakerXVF3800::setup() {
                this->firmware_bin_version_minor_, this->firmware_bin_version_patch_, this->firmware_version_major_,
                this->firmware_version_minor_, this->firmware_version_patch_);
       this->start_dfu_update();
+    } else {
+      // XMOS is up and on the expected firmware — push any configured tuning.
+      this->apply_tuning_();
     }
   });
 }
@@ -203,6 +206,8 @@ RespeakerXVF3800UpdaterStatus RespeakerXVF3800::dfu_update_send_block_() {
 #ifdef USE_RESPEAKER_XVF3800_STATE_CALLBACK
         this->state_callback_.call(DFU_COMPLETE, 100.0f, UPDATE_OK);
 #endif
+        // Re-apply tuning: the XMOS has just rebooted onto the new firmware.
+        this->apply_tuning_();
         return UPDATE_OK;
 
       default:
@@ -481,6 +486,45 @@ void RespeakerXVF3800::unlock_beam() {
   this->xmos_write_bytes(AEC_SERVICER_RESID, AEC_FIXEDBEAMS_ONOFF_CMD, off, sizeof(off));
   this->beam_locked_ = false;
   ESP_LOGI(TAG, "Beam lock released");
+}
+
+void RespeakerXVF3800::write_pp_param(uint8_t resid, uint8_t cmd, bool is_int, float value) {
+  // Every PP / Audio-Mgr tuning command takes a single 4-byte value. XS3 and
+  // the ESP32 are both little-endian, so the native byte layout is sent as-is
+  // (matching how lock_beam() ships raw float azimuths).
+  uint8_t payload[4];
+  if (is_int) {
+    int32_t int_value = (int32_t) lroundf(value);
+    memcpy(payload, &int_value, sizeof(int_value));
+  } else {
+    memcpy(payload, &value, sizeof(value));
+  }
+  this->xmos_write_bytes(resid, cmd, payload, sizeof(payload));
+  ESP_LOGI(TAG, "Set XMOS tuning param (resid=%u, cmd=%u) -> %.4f", resid, cmd, value);
+}
+
+void RespeakerXVF3800::apply_tuning_() {
+  for (auto *number : this->tuning_numbers_) {
+    number->apply_initial();
+  }
+}
+
+// --- XVF3800ParamNumber Component ---
+void XVF3800ParamNumber::dump_config() { LOG_NUMBER("", "Respeaker XVF3800 Tuning", this); }
+
+void XVF3800ParamNumber::control(float value) {
+  if (this->parent_ != nullptr) {
+    this->parent_->write_pp_param(this->resid_, this->cmd_, this->is_int_, value);
+  }
+  this->publish_state(value);
+}
+
+void XVF3800ParamNumber::apply_initial() {
+  if (!this->has_initial_ || this->parent_ == nullptr) {
+    return;
+  }
+  this->parent_->write_pp_param(this->resid_, this->cmd_, this->is_int_, this->initial_value_);
+  this->publish_state(this->initial_value_);
 }
 
 void RespeakerXVF3800::xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_t *value, uint8_t write_byte_num) {
