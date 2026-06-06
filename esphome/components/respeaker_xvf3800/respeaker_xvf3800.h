@@ -14,6 +14,7 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
 #include <cstring>
+#include <vector>
 
 namespace esphome {
 namespace respeaker_xvf3800 {
@@ -48,6 +49,21 @@ const uint8_t AEC_AZIMUTH_VALUES_CMD = 75;
 // AEC_FIXEDBEAMSAZIMUTH_VAL : (33, 81, 2, rw, radians) — two floats: beam 1, beam 2
 const uint8_t AEC_FIXEDBEAMS_ONOFF_CMD = 37;
 const uint8_t AEC_FIXEDBEAMS_AZIMUTH_CMD = 81;
+
+// Post-processing (PP) and Audio Manager servicer resource IDs. These host the
+// noise-suppression / AGC tuning parameters documented in the XMOS XVF3800
+// user guide and verified against Respeaker xvf_host.py. Each parameter is a
+// single 4-byte value (float or int32) addressed by (resid, cmd):
+//   PP_MIN_NS          (17, 21, float)  stationary noise-suppression floor
+//   PP_MIN_NN          (17, 22, float)  non-stationary noise-suppression floor
+//   PP_AGCONOFF        (17, 10, int32)  AGC enable
+//   PP_AGCMAXGAIN      (17, 11, float)  AGC max gain
+//   PP_AGCDESIREDLEVEL (17, 12, float)  AGC target output level
+//   PP_ATTNS_MODE      (17, 32, int32)  extra non-speech attenuation mode
+//   PP_ATTNS_NOMINAL   (17, 33, float)  non-speech attenuation at nominal level
+//   PP_ATTNS_SLOPE     (17, 34, float)  non-speech attenuation slope
+const uint8_t PP_SERVICER_RESID = 17;
+const uint8_t AUDIO_MGR_SERVICER_RESID = 35;
 
 const uint8_t RESID_LED = 0x0C;
 const uint8_t RESID_DFU_VERSION = 0xFE;
@@ -182,6 +198,39 @@ class LEDBeamSensor : public sensor::Sensor, public PollingComponent {
   RespeakerXVF3800 *parent_{nullptr};
 };
 
+// XVF3800ParamNumber: a live-tunable number entity bound to one XMOS control
+// command (resid + cmd + type). Writing the number sends the value to the
+// XVF3800 immediately; an optional initial value is (re)applied each time the
+// XMOS finishes booting. One class drives every NS/AGC tuning parameter.
+class XVF3800ParamNumber : public number::Number, public Component {
+ public:
+  void set_parent(RespeakerXVF3800 *parent) { parent_ = parent; }
+  void set_command(uint8_t resid, uint8_t cmd, bool is_int) {
+    resid_ = resid;
+    cmd_ = cmd;
+    is_int_ = is_int;
+  }
+  void set_initial_value(float value) {
+    initial_value_ = value;
+    has_initial_ = true;
+  }
+  void setup() override {}
+  void dump_config() override;
+
+  // Called by the hub once the XMOS is booted and on the correct firmware.
+  void apply_initial();
+
+ protected:
+  void control(float value) override;
+
+  RespeakerXVF3800 *parent_{nullptr};
+  uint8_t resid_{0};
+  uint8_t cmd_{0};
+  bool is_int_{false};
+  float initial_value_{0.0f};
+  bool has_initial_{false};
+};
+
 // --- Main Hub Class ---
 
 class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
@@ -243,6 +292,13 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   void lock_beam();
   void unlock_beam();
 
+  // Write a single 4-byte tuning value (float or int32) to a PP/Audio-Mgr
+  // control command. Used by XVF3800ParamNumber for the NS/AGC tuning knobs.
+  void write_pp_param(uint8_t resid, uint8_t cmd, bool is_int, float value);
+
+  // Register a tuning number so its initial value is applied after XMOS boot.
+  void add_tuning_number(XVF3800ParamNumber *number) { this->tuning_numbers_.push_back(number); }
+
   // Setters for child components
   void set_mute_switch(MuteSwitch *mute_switch) { mute_switch_ = mute_switch; }
   void set_dfu_version_sensor(DFUVersionTextSensor *dfu_version_sensor) { dfu_version_sensor_ = dfu_version_sensor; }
@@ -302,6 +358,10 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   // pinned fixed beam) from the chip instead of the auto-select beam, so the
   // LED ring stays pointed at the captured wake-word direction.
   bool beam_locked_{false};
+
+  // Tuning numbers whose initial values are (re)applied after the XMOS boots.
+  std::vector<XVF3800ParamNumber *> tuning_numbers_;
+  void apply_tuning_();
   
   // Helper method for XMOS communication
   void xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_t *value, uint8_t write_byte_num);
