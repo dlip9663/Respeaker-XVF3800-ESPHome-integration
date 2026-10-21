@@ -14,6 +14,7 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
 #include <cstring>
+#include <vector>
 
 namespace esphome {
 namespace respeaker_xvf3800 {
@@ -63,6 +64,16 @@ const uint8_t AEC_ASROUTONOFF_CMD = 35;  // 1 = category 7 carries ASR beams, 0 
 const uint8_t AEC_ASROUTGAIN_CMD = 36;
 const uint8_t PP_SERVICER_RESID = 17;
 const uint8_t PP_AGCMAXGAIN_CMD = 11;  // comms path only; does not affect the ASR output
+// Fork (dlip9663): further PP parameters, set through set_pp_param(). Like
+// AGCMAXGAIN they act on the comms output (STT on the default route), not on
+// the ASR output. One 4-byte value each. Verified against Respeaker xvf_host.py.
+const uint8_t PP_AGCONOFF_CMD = 10;         // int32: AGC on/off
+const uint8_t PP_AGCDESIREDLEVEL_CMD = 12;  // float: AGC target output level
+const uint8_t PP_MIN_NS_CMD = 21;           // float: stationary noise floor, lower = more suppression
+const uint8_t PP_MIN_NN_CMD = 22;           // float: non-stationary noise floor
+const uint8_t PP_ATTNS_MODE_CMD = 32;       // int32: extra non-speech attenuation (0/1/2)
+const uint8_t PP_ATTNS_NOMINAL_CMD = 33;    // float: non-speech attenuation at nominal level
+const uint8_t PP_ATTNS_SLOPE_CMD = 34;      // float: non-speech attenuation slope
 
 // IO config servicer (GPI inputs). Verified against Respeaker xvf_host.py.
 // GPI_VALUE_ALL : (36, 6, 1, ro, uint32) — bitmap, bit 0 = onboard Mute button.
@@ -290,6 +301,9 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   void set_asr_route(bool asr_route);
   void set_asr_out_gain(float gain);
   void set_agc_max_gain(float gain);
+  // Fork: sets one PP_SERVICER parameter (a PP_*_CMD above). Applied with the
+  // rest of the tuning after boot and after a DFU update.
+  void set_pp_param(uint8_t cmd, float value, bool is_int);
 
  protected:
 #ifdef USE_RESPEAKER_XVF3800_STATE_CALLBACK
@@ -364,6 +378,13 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   void apply_audio_tuning_();
   void write_asr_out_gain_();
   void write_agc_max_gain_();
+  struct PPParam {
+    uint8_t cmd;
+    bool is_int;
+    float value;
+  };
+  std::vector<PPParam> pp_params_;
+  void write_pp_param_(const PPParam &param);
 
   // Helper method for XMOS communication
   void xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_t *value, uint8_t write_byte_num);

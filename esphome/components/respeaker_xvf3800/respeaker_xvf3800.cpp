@@ -8,6 +8,7 @@
 #include "esphome/core/hal.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 
 namespace esphome {
@@ -604,6 +605,36 @@ void RespeakerXVF3800::set_agc_max_gain(float gain) {
     this->write_agc_max_gain_();
 }
 
+void RespeakerXVF3800::set_pp_param(uint8_t cmd, float value, bool is_int) {
+  PPParam *param = nullptr;
+  for (auto &p : this->pp_params_) {
+    if (p.cmd == cmd) {
+      param = &p;
+      break;
+    }
+  }
+  if (param == nullptr) {
+    this->pp_params_.push_back({cmd, is_int, value});
+    param = &this->pp_params_.back();
+  } else {
+    param->is_int = is_int;
+    param->value = value;
+  }
+  if (this->tuning_applied_)
+    this->write_pp_param_(*param);
+}
+
+void RespeakerXVF3800::write_pp_param_(const PPParam &param) {
+  uint8_t payload[4];
+  if (param.is_int) {
+    const int32_t value = (int32_t) lroundf(param.value);
+    memcpy(payload, &value, sizeof(payload));
+  } else {
+    memcpy(payload, &param.value, sizeof(payload));
+  }
+  this->xmos_write_bytes(PP_SERVICER_RESID, param.cmd, payload, sizeof(payload));
+}
+
 void RespeakerXVF3800::write_asr_out_gain_() {
   uint8_t gain[4];
   memcpy(gain, &this->asr_out_gain_, sizeof(gain));
@@ -632,6 +663,8 @@ void RespeakerXVF3800::apply_audio_tuning_() {
 
   this->write_asr_out_gain_();
   this->write_agc_max_gain_();
+  for (const auto &param : this->pp_params_)
+    this->write_pp_param_(param);
   this->tuning_applied_ = true;
   ESP_LOGI(TAG, "Audio tuning sent: route=%s, ASROUTGAIN=%.2f, AGCMAXGAIN=%.1f",
            this->asr_route_ ? "ASR" : "comms", this->asr_out_gain_, this->agc_max_gain_);
