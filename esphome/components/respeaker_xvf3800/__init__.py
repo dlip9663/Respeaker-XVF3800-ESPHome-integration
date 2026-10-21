@@ -3,10 +3,9 @@ from pathlib import Path
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation, core, external_files
-from esphome.components import i2c, switch, text_sensor, sensor, number, select
+from esphome.components import binary_sensor, i2c, switch, text_sensor, sensor, number, select
 from esphome.const import (
-    CONF_ID,
-    CONF_INITIAL_VALUE,
+    CONF_ID, 
     CONF_ON_ERROR,
     CONF_RAW_DATA_ID,
     CONF_TRIGGER_ID,
@@ -17,36 +16,21 @@ from esphome.core import HexInt
 
 # Dependency declarations
 DEPENDENCIES = ["i2c"]
-AUTO_LOAD = ["switch", "text_sensor", "sensor", "number", "select"]
+AUTO_LOAD = ["binary_sensor", "switch", "text_sensor", "sensor", "number", "select"]
 CODEOWNERS = ["@formatBCE"]
 
 # Configuration keys
 CONF_MUTE_SWITCH = "mute_switch"
 CONF_DFU_VERSION = "dfu_version"
 CONF_LED_BEAM_SENSOR = "led_beam_sensor"
+CONF_MUTE_BUTTON = "mute_button"
 CONF_FIRMWARE = "firmware"
 CONF_MD5 = "md5"
 CONF_ON_BEGIN = "on_begin"
 CONF_ON_END = "on_end"
 CONF_ON_PROGRESS = "on_progress"
-CONF_TUNING = "tuning"
 
 DOMAIN = "respeaker_xvf3800"
-
-# XVF3800 post-processing (PP) / Audio-Mgr tuning parameters, each exposed as a
-# live-tunable number entity. Verified against Respeaker xvf_host.py command map
-# and the XMOS XVF3800 user guide.
-#   key: (resid, cmd, is_int, min, max, step, default, icon, description)
-TUNING_PARAMS = {
-    "stationary_noise_suppression":     (17, 21, False, 0.0,  1.0,    0.01,  0.15, "mdi:waveform",      "PP_MIN_NS: stationary noise floor (lower = more suppression)"),
-    "non_stationary_noise_suppression": (17, 22, False, 0.0,  1.0,    0.01,  0.51, "mdi:waveform",      "PP_MIN_NN: non-stationary noise floor"),
-    "agc_enabled":                      (17, 10, True,  0,    1,      1,     1,    "mdi:tune-variant",  "PP_AGCONOFF: automatic gain control on/off"),
-    "agc_max_gain":                     (17, 11, False, 1.0,  1000.0, 1.0,   1000.0, "mdi:volume-plus", "PP_AGCMAXGAIN: maximum AGC gain factor"),
-    "agc_desired_level":                (17, 12, False, 0.0,  1.0,    0.001, 0.003, "mdi:target",       "PP_AGCDESIREDLEVEL: AGC target output level"),
-    "attns_mode":                       (17, 32, True,  0,    2,      1,     0,    "mdi:tune-variant",  "PP_ATTNS_MODE: extra non-speech attenuation (0/1/2)"),
-    "attns_nominal":                    (17, 33, False, 1.0,  10.0,   0.1,   1.0,  "mdi:tune",          "PP_ATTNS_NOMINAL: non-speech attenuation at nominal level"),
-    "attns_slope":                      (17, 34, False, 1.0,  10.0,   0.1,   1.0,  "mdi:tune",          "PP_ATTNS_SLOPE: non-speech attenuation slope"),
-}
 
 # Create a namespace for the component
 respeaker_xvf3800_ns = cg.esphome_ns.namespace('respeaker_xvf3800')
@@ -56,7 +40,9 @@ RespeakerXVF3800FlashAction = respeaker_xvf3800_ns.class_("RespeakerXVF3800Flash
 MuteSwitch = respeaker_xvf3800_ns.class_('MuteSwitch', switch.Switch, cg.PollingComponent)
 DFUVersionTextSensor = respeaker_xvf3800_ns.class_('DFUVersionTextSensor', text_sensor.TextSensor, cg.PollingComponent)
 LEDBeamSensor = respeaker_xvf3800_ns.class_('LEDBeamSensor', sensor.Sensor, cg.PollingComponent)
-XVF3800ParamNumber = respeaker_xvf3800_ns.class_('XVF3800ParamNumber', number.Number, cg.Component)
+MuteButtonBinarySensor = respeaker_xvf3800_ns.class_(
+    'MuteButtonBinarySensor', binary_sensor.BinarySensor, cg.PollingComponent
+)
 
 DFUEndTrigger = respeaker_xvf3800_ns.class_("DFUEndTrigger", automation.Trigger.template())
 DFUErrorTrigger = respeaker_xvf3800_ns.class_("DFUErrorTrigger", automation.Trigger.template())
@@ -91,26 +77,9 @@ def download_firmware(config):
 
     return config
 
-def _tuning_schema():
-    """Build the optional `tuning:` block: one number entity per PP/AGC parameter."""
-    schema = {}
-    for key, (_resid, _cmd, _is_int, _mn, _mx, _st, _default, icon, _desc) in TUNING_PARAMS.items():
-        schema[cv.Optional(key)] = number.number_schema(
-            XVF3800ParamNumber,
-            icon=icon,
-            entity_category="config",
-        ).extend(
-            {
-                cv.Optional(CONF_INITIAL_VALUE): cv.float_,
-            }
-        )
-    return cv.Schema(schema)
-
-
 # Define the configuration schema for the component
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(RespeakerXVF3800),
-    cv.Optional(CONF_TUNING): _tuning_schema(),
     cv.Optional(CONF_MUTE_SWITCH): switch.switch_schema(
         MuteSwitch,
         icon="mdi:microphone-off",
@@ -125,6 +94,11 @@ CONFIG_SCHEMA = cv.Schema({
         accuracy_decimals=0,
         unit_of_measurement="",
     ).extend(cv.polling_component_schema("100ms")),
+    # Needs XMOS firmware with the IO config servicer GPI commands (1.0.9 tested).
+    cv.Optional(CONF_MUTE_BUTTON): binary_sensor.binary_sensor_schema(
+        MuteButtonBinarySensor,
+        icon="mdi:microphone-off",
+    ).extend(cv.polling_component_schema("50ms")),
     cv.GenerateID(CONF_RAW_DATA_ID): cv.declare_id(cg.uint8),
     cv.Optional(CONF_FIRMWARE): cv.All(
                 {
@@ -215,19 +189,12 @@ async def to_code(config):
         cg.add(var.set_led_beam_sensor(led_beam_sensor))
         cg.add(led_beam_sensor.set_parent(var))
 
-    # Set up noise-suppression / AGC tuning numbers if configured
-    tuning = config.get(CONF_TUNING, {})
-    for key, (resid, cmd, is_int, mn, mx, st, _default, _icon, _desc) in TUNING_PARAMS.items():
-        if key not in tuning:
-            continue
-        conf = tuning[key]
-        num = await number.new_number(conf, min_value=mn, max_value=mx, step=st)
-        await cg.register_component(num, conf)
-        cg.add(num.set_parent(var))
-        cg.add(num.set_command(resid, cmd, is_int))
-        if CONF_INITIAL_VALUE in conf:
-            cg.add(num.set_initial_value(conf[CONF_INITIAL_VALUE]))
-        cg.add(var.add_tuning_number(num))
+    # Set up Mute button sensor if configured
+    if CONF_MUTE_BUTTON in config:
+        mute_button = cg.new_Pvariable(config[CONF_MUTE_BUTTON][CONF_ID])
+        await cg.register_component(mute_button, config[CONF_MUTE_BUTTON])
+        await binary_sensor.register_binary_sensor(mute_button, config[CONF_MUTE_BUTTON])
+        cg.add(mute_button.set_parent(var))
 
     if config_fw := config.get(CONF_FIRMWARE):
         firmware_version = config_fw[CONF_VERSION].split(".")

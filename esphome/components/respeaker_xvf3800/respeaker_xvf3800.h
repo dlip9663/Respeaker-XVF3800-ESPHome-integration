@@ -14,7 +14,6 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/hal.h"
 #include <cstring>
-#include <vector>
 
 namespace esphome {
 namespace respeaker_xvf3800 {
@@ -37,7 +36,10 @@ static const uint16_t MAX_XFER = 128;  // maximum number of bytes we can transfe
 const uint8_t GPO_SERVICER_RESID = 20;
 const uint8_t GPO_SERVICER_RESID_GPO_READ_VALUES = 0;
 const uint8_t GPO_SERVICER_RESID_GPO_WRITE_VALUE = 1;
-const uint8_t GPO_SERVICER_RESID_LED_RING_VALUE = 18;
+// LED_RING_COLOR is cmd 19 from firmware 1.0.8 on. Before 1.0.8 it was cmd 18,
+// which 1.0.8 gave to DOA_VALUE. Seeed I2S firmware changelog, v1.0.8.
+const uint8_t GPO_SERVICER_RESID_LED_RING_VALUE = 19;
+const uint8_t GPO_SERVICER_RESID_LED_RING_VALUE_PRE_1_0_8 = 18;
 const uint8_t GPO_GPO_READ_NUM_BYTES = 5;
 
 // AEC Azimuth constants for LED beam sensor
@@ -50,20 +52,25 @@ const uint8_t AEC_AZIMUTH_VALUES_CMD = 75;
 const uint8_t AEC_FIXEDBEAMS_ONOFF_CMD = 37;
 const uint8_t AEC_FIXEDBEAMS_AZIMUTH_CMD = 81;
 
-// Post-processing (PP) and Audio Manager servicer resource IDs. These host the
-// noise-suppression / AGC tuning parameters documented in the XMOS XVF3800
-// user guide and verified against Respeaker xvf_host.py. Each parameter is a
-// single 4-byte value (float or int32) addressed by (resid, cmd):
-//   PP_MIN_NS          (17, 21, float)  stationary noise-suppression floor
-//   PP_MIN_NN          (17, 22, float)  non-stationary noise-suppression floor
-//   PP_AGCONOFF        (17, 10, int32)  AGC enable
-//   PP_AGCMAXGAIN      (17, 11, float)  AGC max gain
-//   PP_AGCDESIREDLEVEL (17, 12, float)  AGC target output level
-//   PP_ATTNS_MODE      (17, 32, int32)  extra non-speech attenuation mode
-//   PP_ATTNS_NOMINAL   (17, 33, float)  non-speech attenuation at nominal level
-//   PP_ATTNS_SLOPE     (17, 34, float)  non-speech attenuation slope
-const uint8_t PP_SERVICER_RESID = 17;
+// Audio tuning commands (resid, cmd) from Respeaker xvf_host.py.
+// AUDIO_MGR_OP_L/R take (category, source): 6 = processed, 7 = AEC residual or
+// ASR, 8 = user chosen (a copy of 6,3). See the XMOS output-selection table:
+// https://www.xmos.com/documentation/XM-014888-PC/html/modules/fwk_xvf/doc/user_guide/03_using_the_host_application.html#output-selection
 const uint8_t AUDIO_MGR_SERVICER_RESID = 35;
+const uint8_t AUDIO_MGR_OP_L_CMD = 15;
+const uint8_t AUDIO_MGR_OP_R_CMD = 19;
+const uint8_t AEC_ASROUTONOFF_CMD = 35;  // 1 = category 7 carries ASR beams, 0 = AEC residuals
+const uint8_t AEC_ASROUTGAIN_CMD = 36;
+const uint8_t PP_SERVICER_RESID = 17;
+const uint8_t PP_AGCMAXGAIN_CMD = 11;  // comms path only; does not affect the ASR output
+
+// IO config servicer (GPI inputs). Verified against Respeaker xvf_host.py.
+// GPI_VALUE_ALL : (36, 6, 1, ro, uint32) — bitmap, bit 0 = onboard Mute button.
+// xvf_host.py calls it active-referenced, but on firmware 1.0.9 bit 0 reads 1
+// while released and 0 while pressed (measured on the device).
+const uint8_t IO_CONFIG_SERVICER_RESID = 36;
+const uint8_t IO_CONFIG_GPI_VALUE_ALL_CMD = 6;
+const uint32_t GPI_MUTE_BUTTON_BIT = 1 << 0;
 
 const uint8_t RESID_LED = 0x0C;
 const uint8_t RESID_DFU_VERSION = 0xFE;
@@ -198,38 +205,19 @@ class LEDBeamSensor : public sensor::Sensor, public PollingComponent {
   RespeakerXVF3800 *parent_{nullptr};
 };
 
-// XVF3800ParamNumber: a live-tunable number entity bound to one XMOS control
-// command (resid + cmd + type). Writing the number sends the value to the
-// XVF3800 immediately; an optional initial value is (re)applied each time the
-// XMOS finishes booting. One class drives every NS/AGC tuning parameter.
-class XVF3800ParamNumber : public number::Number, public Component {
+#ifdef USE_BINARY_SENSOR
+// MuteButtonBinarySensor polls the onboard Mute button. The DSP still mutes on a
+// press by itself; this sensor only reports the button.
+class MuteButtonBinarySensor : public binary_sensor::BinarySensor, public PollingComponent {
  public:
   void set_parent(RespeakerXVF3800 *parent) { parent_ = parent; }
-  void set_command(uint8_t resid, uint8_t cmd, bool is_int) {
-    resid_ = resid;
-    cmd_ = cmd;
-    is_int_ = is_int;
-  }
-  void set_initial_value(float value) {
-    initial_value_ = value;
-    has_initial_ = true;
-  }
-  void setup() override {}
+  void update() override;
   void dump_config() override;
 
-  // Called by the hub once the XMOS is booted and on the correct firmware.
-  void apply_initial();
-
  protected:
-  void control(float value) override;
-
   RespeakerXVF3800 *parent_{nullptr};
-  uint8_t resid_{0};
-  uint8_t cmd_{0};
-  bool is_int_{false};
-  float initial_value_{0.0f};
-  bool has_initial_{false};
 };
+#endif
 
 // --- Main Hub Class ---
 
@@ -278,6 +266,8 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   bool read_gpio_status(uint32_t *gpio_status);
   bool read_mute_status();
   void write_mute_status(bool value);
+  // Reads the Mute button. Returns false if the DSP gave no valid answer.
+  bool read_mute_button(bool &pressed);
   
   // Individual LED ring control (12 LEDs)
   void set_led_ring(uint32_t *rgb_array);
@@ -292,17 +282,14 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   void lock_beam();
   void unlock_beam();
 
-  // Write a single 4-byte tuning value (float or int32) to a PP/Audio-Mgr
-  // control command. Used by XVF3800ParamNumber for the NS/AGC tuning knobs.
-  void write_pp_param(uint8_t resid, uint8_t cmd, bool is_int, float value);
-
-  // Register a tuning number so its initial value is applied after XMOS boot.
-  void add_tuning_number(XVF3800ParamNumber *number) { this->tuning_numbers_.push_back(number); }
-
   // Setters for child components
   void set_mute_switch(MuteSwitch *mute_switch) { mute_switch_ = mute_switch; }
   void set_dfu_version_sensor(DFUVersionTextSensor *dfu_version_sensor) { dfu_version_sensor_ = dfu_version_sensor; }
   void set_led_beam_sensor(LEDBeamSensor *led_beam_sensor) { led_beam_sensor_ = led_beam_sensor; }
+
+  void set_asr_route(bool asr_route);
+  void set_asr_out_gain(float gain);
+  void set_agc_max_gain(float gain);
 
  protected:
 #ifdef USE_RESPEAKER_XVF3800_STATE_CALLBACK
@@ -313,6 +300,7 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   bool firmware_bin_is_valid_() { return this->firmware_bin_ != nullptr && this->firmware_bin_length_; }
   bool version_read_();
   bool versions_match_();
+  bool chip_version_at_least_(uint8_t major, uint8_t minor, uint8_t patch);
 
   bool dfu_get_status_();
   bool dfu_get_version_();
@@ -359,10 +347,24 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   // LED ring stays pointed at the captured wake-word direction.
   bool beam_locked_{false};
 
-  // Tuning numbers whose initial values are (re)applied after the XMOS boots.
-  std::vector<XVF3800ParamNumber *> tuning_numbers_;
-  void apply_tuning_();
-  
+  // Last azimuth the DSP actually returned, and when. The 10 Hz beam poll keeps
+  // this fresh, so lock_beam() can pin the beam without its own blocking read.
+  float last_azimuth_rad_{0.0f};
+  uint32_t last_azimuth_ms_{0};
+
+  // Last frame written by set_led_ring(), so an unchanged frame skips the bus.
+  uint32_t last_led_frame_[12]{};
+  bool led_frame_valid_{false};
+
+  // The chip resets these on power-up; they are (re)applied after boot.
+  bool asr_route_{false};
+  float asr_out_gain_{1.0f};
+  float agc_max_gain_{32.0f};
+  bool tuning_applied_{false};
+  void apply_audio_tuning_();
+  void write_asr_out_gain_();
+  void write_agc_max_gain_();
+
   // Helper method for XMOS communication
   void xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_t *value, uint8_t write_byte_num);
 
@@ -372,6 +374,8 @@ class RespeakerXVF3800 : public i2c::I2CDevice, public Component {
   //   2 = free-running beam
   //   3 = auto-select beam (default — what the adaptive LED follows)
   // Returns true on success. Shared by read_led_beam_direction() and lock_beam().
+  // Single attempt, never blocks: a CTRL_WAIT answer returns false and the next
+  // poll retries. Do not add a retry loop here — it runs in the main loop.
   bool read_azimuth_radians_(float &out_radians, uint8_t beam_index = 3);
 };
 

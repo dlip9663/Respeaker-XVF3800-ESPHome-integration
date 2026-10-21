@@ -8,6 +8,7 @@
 #include "esphome/core/hal.h"
 
 #include <cinttypes>
+#include <cstring>
 
 namespace esphome {
 namespace respeaker_xvf3800 {
@@ -36,8 +37,7 @@ void RespeakerXVF3800::setup() {
                this->firmware_version_minor_, this->firmware_version_patch_);
       this->start_dfu_update();
     } else {
-      // XMOS is up and on the expected firmware — push any configured tuning.
-      this->apply_tuning_();
+      this->apply_audio_tuning_();
     }
   });
 }
@@ -203,11 +203,11 @@ RespeakerXVF3800UpdaterStatus RespeakerXVF3800::dfu_update_send_block_() {
           return UPDATE_FAILED;
         }
         ESP_LOGI(TAG, "Update complete");
+        // The XMOS rebooted with default settings, so re-apply the tuning.
+        this->apply_audio_tuning_();
 #ifdef USE_RESPEAKER_XVF3800_STATE_CALLBACK
         this->state_callback_.call(DFU_COMPLETE, 100.0f, UPDATE_OK);
 #endif
-        // Re-apply tuning: the XMOS has just rebooted onto the new firmware.
-        this->apply_tuning_();
         return UPDATE_OK;
 
       default:
@@ -243,6 +243,14 @@ bool RespeakerXVF3800::versions_match_() {
   return this->firmware_bin_version_major_ == this->firmware_version_major_ &&
          this->firmware_bin_version_minor_ == this->firmware_version_minor_ &&
          this->firmware_bin_version_patch_ == this->firmware_version_patch_;
+}
+
+bool RespeakerXVF3800::chip_version_at_least_(uint8_t major, uint8_t minor, uint8_t patch) {
+  if (this->firmware_version_major_ != major)
+    return this->firmware_version_major_ > major;
+  if (this->firmware_version_minor_ != minor)
+    return this->firmware_version_minor_ > minor;
+  return this->firmware_version_patch_ >= patch;
 }
 
 bool RespeakerXVF3800::dfu_get_status_() {
@@ -291,6 +299,8 @@ bool RespeakerXVF3800::dfu_get_version_() {
   this->firmware_version_major_ = version_resp[1];
   this->firmware_version_minor_ = version_resp[2];
   this->firmware_version_patch_ = version_resp[3];
+  // The LED ring command depends on the version, so send the next frame again.
+  this->led_frame_valid_ = false;
   if (this->firmware_version_ != nullptr) {
     this->firmware_version_->publish_state(version);
   }
@@ -387,6 +397,27 @@ void RespeakerXVF3800::write_mute_status(bool value) {
   }
 }
 
+bool RespeakerXVF3800::read_mute_button(bool &pressed) {
+  const uint8_t request[] = {IO_CONFIG_SERVICER_RESID, IO_CONFIG_GPI_VALUE_ALL_CMD | 0x80,
+                             5};  // 4 bytes (uint32) + 1 status byte
+  uint8_t response[5];
+
+  // Single attempt, like the azimuth read: the next poll is the retry.
+  if (this->write_read(request, sizeof(request), response, sizeof(response)) != i2c::ERROR_OK) {
+    ESP_LOGV(TAG, "Failed to read GPI values");
+    return false;
+  }
+  if (response[0] != CTRL_DONE) {
+    ESP_LOGV(TAG, "GPI read returned status %u", response[0]);
+    return false;
+  }
+
+  uint32_t levels;
+  memcpy(&levels, &response[1], sizeof(levels));
+  pressed = (levels & GPI_MUTE_BUTTON_BIT) == 0;  // the bit is low while pressed
+  return true;
+}
+
 bool RespeakerXVF3800::read_azimuth_radians_(float &out_radians, uint8_t beam_index) {
   if (beam_index > 3) {
     ESP_LOGW(TAG, "read_azimuth_radians_: invalid beam index %u", beam_index);
@@ -399,39 +430,41 @@ bool RespeakerXVF3800::read_azimuth_radians_(float &out_radians, uint8_t beam_in
 
   uint8_t aec_resp[17];
 
-  // The XMOS transport protocol can return CTRL_WAIT (1) when the servicer is
-  // busy; the host is expected to retry. The fast LED poll hides this naturally,
-  // but a one-shot read (e.g. from lock_beam) has to retry explicitly.
-  const uint8_t max_attempts = 8;
-  for (uint8_t attempt = 0; attempt < max_attempts; attempt++) {
-    i2c::ErrorCode err = this->write_read(aec_req, sizeof(aec_req), aec_resp, sizeof(aec_resp));
-    if (err != i2c::ERROR_OK) {
-      ESP_LOGW(TAG, "Failed to read AEC azimuth values, error=%d", (int)err);
-      return false;
-    }
-
-    uint8_t status = aec_resp[0];
-    if (status == CTRL_DONE) {
-      // 4 floats follow at bytes [1..16]: beam 1, beam 2, free-running, auto-select.
-      const uint8_t offset = 1 + beam_index * sizeof(float);
-      float radians;
-      memcpy(&radians, &aec_resp[offset], sizeof(float));
-      ESP_LOGD(TAG, "AEC azimuth (beam %u, raw radians): %f", beam_index, radians);
-      out_radians = radians;
-      return true;
-    }
-
-    if (status != CTRL_WAIT && status != SERVICER_COMMAND_RETRY) {
-      ESP_LOGW(TAG, "AEC azimuth read returned unexpected status 0x%02X — giving up", status);
-      return false;
-    }
-
-    delayMicroseconds(500);
+  // Single attempt. The XMOS transport protocol can return CTRL_WAIT (1) when the
+  // servicer is busy, and the host is expected to retry — but this runs in the
+  // ESPHome main loop, so the 10 Hz beam poll is the retry mechanism. A blocking
+  // retry loop here stalls every other component's loop().
+  i2c::ErrorCode err = this->write_read(aec_req, sizeof(aec_req), aec_resp, sizeof(aec_resp));
+  if (err != i2c::ERROR_OK) {
+    ESP_LOGW(TAG, "Failed to read AEC azimuth values, error=%d", (int)err);
+    return false;
   }
 
-  // Exhausted retries on a retry status. This is normal during silence
-  // (no source to localize → no fresh azimuth), hence DEBUG not WARN.
-  ESP_LOGD(TAG, "AEC azimuth read still busy after %u attempts (no fresh data)", max_attempts);
+  uint8_t status = aec_resp[0];
+  if (status == CTRL_DONE) {
+    // 4 floats follow at bytes [1..16]: beam 1, beam 2, free-running, auto-select.
+    const uint8_t offset = 1 + beam_index * sizeof(float);
+    float radians;
+    memcpy(&radians, &aec_resp[offset], sizeof(float));
+    ESP_LOGD(TAG, "AEC azimuth (beam %u, raw radians): %f", beam_index, radians);
+    out_radians = radians;
+    // Cache only the auto-select beam. That is the slot lock_beam() wants, and
+    // the pinned slots would otherwise feed the lock back its own value.
+    if (beam_index == 3) {
+      this->last_azimuth_rad_ = radians;
+      this->last_azimuth_ms_ = millis();
+    }
+    return true;
+  }
+
+  if (status != CTRL_WAIT && status != SERVICER_COMMAND_RETRY) {
+    ESP_LOGW(TAG, "AEC azimuth read returned unexpected status 0x%02X", status);
+    return false;
+  }
+
+  // Servicer busy. Normal during silence (no source to localize → no fresh
+  // azimuth), hence DEBUG not WARN. The next poll picks it up.
+  ESP_LOGD(TAG, "AEC azimuth read busy (status 0x%02X, no fresh data)", status);
   return false;
 }
 
@@ -459,9 +492,17 @@ int RespeakerXVF3800::read_led_beam_direction() {
 }
 
 void RespeakerXVF3800::lock_beam() {
+  // Prefer the value the 10 Hz beam poll already has. It is at most one poll
+  // old, it is the direction the wake word came from, and it costs no bus time
+  // on the wake-word path. Fall back to one read if the poll is off or stale.
+  const uint32_t max_age_ms = 500;
   float radians;
-  if (!this->read_azimuth_radians_(radians)) {
-    ESP_LOGW(TAG, "lock_beam: failed to read current azimuth; not locking");
+  if (this->last_azimuth_ms_ != 0 && (millis() - this->last_azimuth_ms_) <= max_age_ms) {
+    radians = this->last_azimuth_rad_;
+  } else if (!this->read_azimuth_radians_(radians)) {
+    // Expected when the beam poll is disabled, or when the DSP has no source to
+    // localize yet. Beam lock is an opt-in enhancement, so a miss is not an error.
+    ESP_LOGD(TAG, "lock_beam: no fresh azimuth (beam poll disabled or DSP busy); not locking");
     return;
   }
 
@@ -488,45 +529,6 @@ void RespeakerXVF3800::unlock_beam() {
   ESP_LOGI(TAG, "Beam lock released");
 }
 
-void RespeakerXVF3800::write_pp_param(uint8_t resid, uint8_t cmd, bool is_int, float value) {
-  // Every PP / Audio-Mgr tuning command takes a single 4-byte value. XS3 and
-  // the ESP32 are both little-endian, so the native byte layout is sent as-is
-  // (matching how lock_beam() ships raw float azimuths).
-  uint8_t payload[4];
-  if (is_int) {
-    int32_t int_value = (int32_t) lroundf(value);
-    memcpy(payload, &int_value, sizeof(int_value));
-  } else {
-    memcpy(payload, &value, sizeof(value));
-  }
-  this->xmos_write_bytes(resid, cmd, payload, sizeof(payload));
-  ESP_LOGI(TAG, "Set XMOS tuning param (resid=%u, cmd=%u) -> %.4f", resid, cmd, value);
-}
-
-void RespeakerXVF3800::apply_tuning_() {
-  for (auto *number : this->tuning_numbers_) {
-    number->apply_initial();
-  }
-}
-
-// --- XVF3800ParamNumber Component ---
-void XVF3800ParamNumber::dump_config() { LOG_NUMBER("", "Respeaker XVF3800 Tuning", this); }
-
-void XVF3800ParamNumber::control(float value) {
-  if (this->parent_ != nullptr) {
-    this->parent_->write_pp_param(this->resid_, this->cmd_, this->is_int_, value);
-  }
-  this->publish_state(value);
-}
-
-void XVF3800ParamNumber::apply_initial() {
-  if (!this->has_initial_ || this->parent_ == nullptr) {
-    return;
-  }
-  this->parent_->write_pp_param(this->resid_, this->cmd_, this->is_int_, this->initial_value_);
-  this->publish_state(this->initial_value_);
-}
-
 void RespeakerXVF3800::xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_t *value, uint8_t write_byte_num) {
   uint8_t payload[3 + 255];
   payload[0] = resid;
@@ -545,8 +547,14 @@ void RespeakerXVF3800::xmos_write_bytes(uint8_t resid, uint8_t cmd, const uint8_
 }
 
 void RespeakerXVF3800::set_led_ring(uint32_t *rgb_array) {
-  ESP_LOGD(TAG, "Setting LED ring with individual colors");
-  
+  // The YAML animation interval calls this 20 times a second whether the frame
+  // changed or not. Skip the bus when it did not.
+  if (this->led_frame_valid_ && memcmp(this->last_led_frame_, rgb_array, sizeof(this->last_led_frame_)) == 0) {
+    return;
+  }
+  memcpy(this->last_led_frame_, rgb_array, sizeof(this->last_led_frame_));
+  this->led_frame_valid_ = true;
+
   uint8_t payload[48];
   
   for (int i = 0; i < 12; i++) {
@@ -557,7 +565,9 @@ void RespeakerXVF3800::set_led_ring(uint32_t *rgb_array) {
     payload[i * 4 + 3] = 0x00;
   }
   
-  this->xmos_write_bytes(GPO_SERVICER_RESID, GPO_SERVICER_RESID_LED_RING_VALUE, payload, 48);
+  const uint8_t cmd = this->chip_version_at_least_(1, 0, 8) ? GPO_SERVICER_RESID_LED_RING_VALUE
+                                                            : GPO_SERVICER_RESID_LED_RING_VALUE_PRE_1_0_8;
+  this->xmos_write_bytes(GPO_SERVICER_RESID, cmd, payload, 48);
 }
 
 std::string RespeakerXVF3800::read_dfu_version() {
@@ -574,6 +584,57 @@ std::string RespeakerXVF3800::read_dfu_version() {
     }
   }
   return "Unknown";
+}
+
+void RespeakerXVF3800::set_asr_route(bool asr_route) {
+  this->asr_route_ = asr_route;
+  if (this->tuning_applied_)
+    this->apply_audio_tuning_();
+}
+
+void RespeakerXVF3800::set_asr_out_gain(float gain) {
+  this->asr_out_gain_ = gain;
+  if (this->tuning_applied_)
+    this->write_asr_out_gain_();
+}
+
+void RespeakerXVF3800::set_agc_max_gain(float gain) {
+  this->agc_max_gain_ = gain;
+  if (this->tuning_applied_)
+    this->write_agc_max_gain_();
+}
+
+void RespeakerXVF3800::write_asr_out_gain_() {
+  uint8_t gain[4];
+  memcpy(gain, &this->asr_out_gain_, sizeof(gain));
+  this->xmos_write_bytes(AEC_SERVICER_RESID, AEC_ASROUTGAIN_CMD, gain, sizeof(gain));
+}
+
+void RespeakerXVF3800::write_agc_max_gain_() {
+  uint8_t gain[4];
+  memcpy(gain, &this->agc_max_gain_, sizeof(gain));
+  this->xmos_write_bytes(PP_SERVICER_RESID, PP_AGCMAXGAIN_CMD, gain, sizeof(gain));
+}
+
+void RespeakerXVF3800::apply_audio_tuning_() {
+  // ASR route: both slots get the ASR output (7,3). Stock: comms (8,0) on STT.
+  const uint8_t l_cat = this->asr_route_ ? 7 : 8;
+  const uint8_t l_src = this->asr_route_ ? 3 : 0;
+  const uint8_t l[2] = {l_cat, l_src};
+  const uint8_t r[2] = {7, 3};
+
+  // Category 7 is the ASR beam only while this is 1; otherwise (7,3) is mic 3's residual.
+  const uint8_t asr_on[4] = {0x01, 0x00, 0x00, 0x00};  // int32 LE
+  this->xmos_write_bytes(AEC_SERVICER_RESID, AEC_ASROUTONOFF_CMD, asr_on, sizeof(asr_on));
+
+  this->xmos_write_bytes(AUDIO_MGR_SERVICER_RESID, AUDIO_MGR_OP_L_CMD, l, sizeof(l));
+  this->xmos_write_bytes(AUDIO_MGR_SERVICER_RESID, AUDIO_MGR_OP_R_CMD, r, sizeof(r));
+
+  this->write_asr_out_gain_();
+  this->write_agc_max_gain_();
+  this->tuning_applied_ = true;
+  ESP_LOGI(TAG, "Audio tuning sent: route=%s, ASROUTGAIN=%.2f, AGCMAXGAIN=%.1f",
+           this->asr_route_ ? "ASR" : "comms", this->asr_out_gain_, this->agc_max_gain_);
 }
 
 // =========================================================================
@@ -660,6 +721,24 @@ void LEDBeamSensor::update() {
   //   ESP_LOGW(TAG, "Invalid LED beam direction: %d", led_index);
   }
 }
+
+#ifdef USE_BINARY_SENSOR
+// --- MuteButtonBinarySensor Component ---
+void MuteButtonBinarySensor::dump_config() {
+  LOG_BINARY_SENSOR("", "Respeaker Mute Button", this);
+}
+
+void MuteButtonBinarySensor::update() {
+  if (this->parent_ == nullptr || this->parent_->is_failed()) {
+    return;
+  }
+
+  bool pressed;
+  if (this->parent_->read_mute_button(pressed)) {
+    this->publish_state(pressed);
+  }
+}
+#endif
 
 }  // namespace respeaker_xvf3800
 }  // namespace esphome
