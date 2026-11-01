@@ -25,3 +25,14 @@ To make a file again, use this command:
 ```bash
 ffmpeg -i <source file> -map_metadata -1 -map 0:a -ac 1 -ar 48000 -c:a libopus -b:a 48k -fflags +bitexact -flags:a +bitexact <name>.opus
 ```
+
+## wake_click.opus
+
+Fork (dlip9663): an 80 ms click made for this fork (not a Voice PE sound), for use
+as a short wake sound. With the 0.95 s `wake_word_triggered.opus`, the sound keeps
+playing after the assistant starts, and the DSP suppresses the microphone while it
+plays, so the first word of the command is lost. Generated with:
+
+```bash
+ffmpeg -f lavfi -i "aevalsrc='0.5*(sin(2*PI*1500*t)+0.4*sin(2*PI*2250*t))*min(t/0.003,1)*exp(-t/0.018)':s=48000:d=0.08" -map_metadata -1 -ac 1 -ar 48000 -c:a libopus -b:a 48k -fflags +bitexact -flags:a +bitexact wake_click.opus
+```

@@ -28,6 +28,11 @@ substitutions:
   error_cloud_expired_sound_file: https://github.com/formatBCE/Respeaker-XVF3800-ESPHome-integration/raw/${respeaker_ref}/sounds/error_cloud_expired.opus
   # Fork (dlip9663): room name sent with esphome.bark_detected.
   bark_room: unknown
+  # Fork (dlip9663): pause between starting the wake sound and starting the
+  # assistant. The DSP suppresses the microphone while its own speaker plays, so
+  # any part of the wake sound still playing once the assistant starts mutes the
+  # start of the command. Set it just past the length of the wake sound.
+  wake_sound_delay: 300ms
 
 switch:
   # Mute Sound Switch.
@@ -272,7 +277,7 @@ micro_wake_word:
                                       id: play_sound
                                       priority: true
                                       sound_file: "wake_word_triggered_sound"
-                                  - delay: 300ms
+                                  - delay: ${wake_sound_delay}
                             - voice_assistant.start:
                                 wake_word: !lambda return wake_word;
                             # Pin the AEC beam to the wake-word direction before any
