@@ -48,8 +48,10 @@ i2s_audio:
     #   allow_other_uses: true
 
 microphone:
+  # The I2S clocks run at 48 kHz for the speaker and the microphones together,
+  # so the microphones run at 48 kHz too.
   - platform: i2s_audio
-    id: i2s_mics
+    id: i2s_mics_raw
     i2s_din_pin: GPIO43
     adc_type: external
     pdm: false
@@ -58,6 +60,14 @@ microphone:
     i2s_mode: secondary
     i2s_audio_id: i2s_input
     channel: stereo
+  # Voice assistant and wake word need 16 kHz. Both channels stay. The DSP
+  # output has no content above 8 kHz, so this keeps 1 frame of 3 with no
+  # filter. The stock resampler cuts 4 to 7.5 kHz by 2 to 17 dB.
+  - platform: decimator
+    id: i2s_mics
+    microphone:
+      microphone: i2s_mics_raw
+      channels: [0, 1]
 
 speaker:
   # Hardware speaker output
@@ -97,11 +107,6 @@ speaker:
     output_speaker: media_mixing_input
     sample_rate: 48000
     bits_per_sample: 16
-
-sendspin:
-  id: sendspin_hub
-  task_stack_in_psram: false
-
 
 respeaker_xvf3800:
   id: respeaker

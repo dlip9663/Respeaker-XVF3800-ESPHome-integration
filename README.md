@@ -54,14 +54,16 @@ The **LED Ring** light controls the 12-LED ring. Read
 
 ## Requirements
 
-- ESPHome **2026.9.0** or later.
+- ESPHome **2026.10.0** or later.
 - Home Assistant with the ESPHome integration.
 - A reSpeaker XVF3800 USB 4-Mic Array board.
 - A USB-C cable and a computer that can flash the board.
 
-This project needs a **patched `i2s_audio` component**. The standard ESPHome
-component does not work with this board. The `base.yaml` package gets the patch
-from a fork. You do not need to install it yourself.
+The microphones run at 48 kHz, the same clock as the speaker. The
+`decimator` microphone platform converts them to 16 kHz for the voice
+assistant and the wake word. It keeps 1 frame of 3 and does not filter the
+audio. The DSP processes the audio at 16 kHz, so the 48 kHz stream has no
+content above 8 kHz. This needs ESPHome 2026.10.0 or later.
 
 ---
 
@@ -89,7 +91,7 @@ Create a file for your device. The packages give all the other configuration.
 substitutions:
   name: respeaker-xvf3800-assistant
   friendly_name: reSpeaker XVF3800 Assistant
-  respeaker_ref: 2026.10.1
+  respeaker_ref: 2026.10.4
 
 packages:
   respeaker:
@@ -181,11 +183,11 @@ substitution in a package.
 | `name` | `respeaker-xvf3800-assistant` | ESPHome node name |
 | `friendly_name` | `reSpeaker XVF3800 Assistant` | Display name |
 | `respeaker_ref` | the current release, for example `2026.9.1` | Release for the packages, the components, and the firmware |
-| `i2s_audio_ref` | `respeaker_microphone` | Ref for the patched `i2s_audio` fork |
+| `respeaker_lite_ref` | a Respeaker Lite release, set by each release | Release of the voice satellite core. Read [Package layout](#package-layout) |
 | `hidden_ssid` | `"false"` | Set this to `"true"` for a hidden network |
 | `log_level` | `INFO` | Logger level |
 | `voice_assist_*_phase_id` | `1` to `11` | Phase constants for the LED ring |
-| `*_sound_file` | Voice PE sound URLs | URL of each notification sound |
+| `*_sound_file` | the sounds of the voice satellite core | URL of each notification sound |
 
 **Caution:** All substitutions share one namespace. A name that you set in your
 configuration replaces that name in every package.
@@ -298,6 +300,11 @@ and the DSP firmware. So the YAML and the firmware always match. Use
 the `packages:` block, ESPHome takes the YAML from your tag but the C++ from
 another ref. That mismatch is difficult to find.
 
+Each release also sets `respeaker_lite_ref` to a release of the
+[Respeaker Lite integration](https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration).
+That release supplies the voice satellite core. Keep the default value. The
+release workflow checks that the two releases work together.
+
 To update the device:
 1. Set `respeaker_ref` to the tag of the new release.
 2. Install the configuration on the device again.
@@ -313,19 +320,26 @@ fully reproducible build.
 
 ## Package layout
 
+The voice satellite core comes from the `packages/core/` directory of the
+[Respeaker Lite integration](https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration)
+at `respeaker_lite_ref`. The core holds the boot and connection logic, the
+wake word, the voice pipeline, the media player, the timers, the alarm, and the
+sounds. Koala Satellite and the Respeaker Lite use the same core. The
+`base.yaml` package includes the core, so your configuration does not change.
+
 | Package | Contents |
 | --- | --- |
-| `base.yaml` | `esphome`, `esp32`, `psram`, `logger`, `network`, `wifi`, `api`, `i2c`, `debug`, `external_components` |
+| `base.yaml` | The voice satellite core, `esphome`, `esp32`, `psram`, the logger level, the Wi-Fi tuning, the `set_led_color` action, `i2c`, `external_components` |
 | `hardware.yaml` | `i2s_audio`, `microphone`, `speaker`, `audio_dac`, `respeaker_xvf3800` with the DFU firmware |
-| `voice-assistant.yaml` | `micro_wake_word`, `voice_assistant`, `media_player`, `media_source`, `audio_file` |
+| `voice-assistant.yaml` | The beam lock, the wake word gain, the volume range and the volume display of the media player |
 | `leds.yaml` | LED globals, the animation interval, the effect scripts, the colour preset |
-| `timers-alarm.yaml` | `time`, `datetime`, the alarm and timer entities, the timer scripts |
+| `timers-alarm.yaml` | The timer animation of the LED ring |
 
 **Caution:** Include all five packages. They are separate files for maintenance,
-but they are not independent. The `leds.yaml` package reads entities from
-`hardware.yaml`, `voice-assistant.yaml`, and `timers-alarm.yaml`. The
-`control_leds` script runs from `wifi`, `api`, `on_boot`, and 12 voice assistant
-triggers. If you remove one file, the build fails.
+but they are not independent. The `leds.yaml` package reads entities from the
+core and from `hardware.yaml`. The `control_leds` script runs from `wifi`,
+`api`, `on_boot`, and 12 voice assistant triggers. If you remove one file, the
+build fails.
 
 To change one part, use `!extend` or `!remove`. Do not delete a package.
 
@@ -585,6 +599,21 @@ packages:
   timers_alarm: !include ../packages/timers-alarm.yaml
 ```
 
+The `base.yaml` package still gets the core from GitHub at
+`respeaker_lite_ref`. To test a change to the core, clone the Respeaker Lite
+repository next to this repository. Then replace the `satellite_core` package
+in `packages/base.yaml` with local includes:
+
+```yaml
+packages:
+  core_base: !include ../../Respeaker-Lite-ESPHome-integration/packages/core/base.yaml
+  core_voice_assistant: !include ../../Respeaker-Lite-ESPHome-integration/packages/core/voice-assistant.yaml
+  core_media_player: !include ../../Respeaker-Lite-ESPHome-integration/packages/core/media-player.yaml
+  core_timers_alarm: !include ../../Respeaker-Lite-ESPHome-integration/packages/core/timers-alarm.yaml
+```
+
+Do not commit this change.
+
 Useful commands:
 
 ```bash
@@ -646,5 +675,6 @@ connection to Home Assistant, because the LED state follows the API state.
 - The notification sounds come from the
   [Home Assistant Voice PE](https://github.com/esphome/home-assistant-voice-pe) project.
   The sounds are © 2024 by Clayton Charles Tapp, under CC BY 4.0. The `sounds/`
-  directory holds copies in Ogg Opus format. Read
-  [sounds/LICENSE.md](sounds/LICENSE.md) for the changes.
+  directory of the Respeaker Lite integration holds copies in Ogg Opus format.
+  Read [its sounds/LICENSE.md](https://github.com/formatBCE/Respeaker-Lite-ESPHome-integration/blob/main/sounds/LICENSE.md)
+  for the changes.
